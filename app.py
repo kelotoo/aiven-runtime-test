@@ -29,15 +29,20 @@ SOCKET_CANDIDATES = [
     "/run/user/0/podman/podman.sock",
     "/var/run/crio/crio.sock",
     "/run/containerd/containerd.sock",
+    "/hostfs/var/run/docker.sock",
+    "/hostfs/run/podman/podman.sock",
 ]
 
-# Well-known, unauthenticated-by-default status endpoints used ONLY to positively identify
-# a service if its port is open - no job/secret enumeration, no auth attempted.
 IDENTIFY_ENDPOINTS = {
     "nomad_agent_self": "http://{host}:4646/v1/agent/self",
     "vault_sys_health": "http://{host}:8200/v1/sys/health",
     "consul_agent_self": "http://{host}:8500/v1/agent/self",
 }
+
+# A fully-privileged, unrestricted container normally has this exact 64-bit capability mask
+# (all standard capability bits set) in CapEff/CapBnd. Used only as a comparison reference,
+# never used to actually exercise any capability.
+FULL_CAP_MASK_HEX = "0000003fffffffff"
 
 
 def redact_env():
@@ -109,8 +114,6 @@ def get_ps_aux():
 
 
 def identify_services(hosts):
-    """For each candidate host, try the well-known unauth status endpoints.
-    Read-only GET, small timeout, no auth, no write/enumeration calls."""
     results = {}
     for host in hosts:
         if not host:
@@ -120,6 +123,69 @@ def identify_services(hosts):
             key = f"{host}:{name}"
             results[key] = check_metadata_endpoint(url, timeout=2)
     return results
+
+
+def check_capabilities():
+    """Passive-only: reads our own /proc/self/status capability masks. Does not exercise
+    any capability, does not attempt privileged operations - detection only."""
+    result = {}
+    status = read_file_safe("/proc/self/status", max_bytes=4000)
+    if status.startswith("error:"):
+        return {"error": status}
+    caps = {}
+    for line in status.splitlines():
+        if line.startswith(("CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:")):
+            k, v = line.split(":", 1)
+            caps[k.strip()] = v.strip()
+    result["raw"] = caps
+    eff = caps.get("CapEff", "")
+    result["cap_eff_is_full_privileged_mask"] = (eff == FULL_CAP_MASK_HEX)
+    return result
+
+
+def check_hostfs_mount():
+    """Passive-only: checks for existence of a /hostfs mount point (from a
+    `volumes: - /:/hostfs:ro` compose directive) and lists top-level directory NAMES only.
+    Never reads file contents."""
+    result = {"mount_point_exists": os.path.isdir("/hostfs")}
+    if result["mount_point_exists"]:
+        try:
+            entries = sorted(os.listdir("/hostfs"))
+            result["top_level_entries"] = entries[:60]
+            fhs_markers = {"etc", "proc", "sys", "dev", "var", "usr", "bin"}
+            result["looks_like_real_root_fs"] = fhs_markers.issubset(set(entries))
+            own_hostname = read_file_safe("/etc/hostname").strip()
+            host_hostname = read_file_safe("/hostfs/etc/hostname").strip()
+            result["own_hostname"] = own_hostname
+            result["hostfs_etc_hostname"] = host_hostname
+            result["hostfs_hostname_differs_from_own"] = (
+                host_hostname != own_hostname and not host_hostname.startswith("error:")
+            )
+        except Exception as e:
+            result["listdir_error"] = str(e)
+    return result
+
+
+def check_dev_listing():
+    """Passive-only: lists /dev entry names (not contents) - a minimal unprivileged
+    container normally has a small fixed set (null, zero, random, urandom, tty, console,
+    ptmx, pts/, shm, mqueue, fd). Real block/char devices (sda, nvme0n1, kmsg, mem, etc.)
+    appearing here would indicate device passthrough from a privileged/host context."""
+    try:
+        return sorted(os.listdir("/dev"))
+    except Exception as e:
+        return f"error: {e}"
+
+
+def check_network_interfaces():
+    """Passive-only: lists network interface names via /sys/class/net - a normal
+    container has just lo + one veth/eth virtual interface. Seeing many interfaces
+    (docker0/podman0 bridge, multiple veth* pairs for OTHER containers, physical NIC
+    names) would indicate network_mode: host was honored."""
+    try:
+        return sorted(os.listdir("/sys/class/net"))
+    except Exception as e:
+        return f"error: {e}"
 
 
 def run_recon():
@@ -163,21 +229,12 @@ def run_recon():
         headers={"Metadata": "true"},
     )
 
-    # Only actually call identify endpoints against hosts whose relevant port showed "open"
-    # in the scans above - keeps this targeted rather than blind.
     identify_hosts = set()
-    if gw and result.get("gateway_port_scan", {}).get("4646") == "open":
-        identify_hosts.add(gw)
-    if gw and result.get("gateway_port_scan", {}).get("8200") == "open":
-        identify_hosts.add(gw)
-    if gw and result.get("gateway_port_scan", {}).get("8500") == "open":
-        identify_hosts.add(gw)
-    if result.get("localhost_port_scan", {}).get("4646") == "open":
-        identify_hosts.add("127.0.0.1")
-    if result.get("localhost_port_scan", {}).get("8200") == "open":
-        identify_hosts.add("127.0.0.1")
-    if result.get("localhost_port_scan", {}).get("8500") == "open":
-        identify_hosts.add("127.0.0.1")
+    for host_label, host_val in (("gw", gw), ("localhost", "127.0.0.1")):
+        scan = result.get("gateway_port_scan", {}) if host_label == "gw" else result.get("localhost_port_scan", {})
+        for p in ("4646", "8200", "8500"):
+            if scan.get(p) == "open":
+                identify_hosts.add(host_val if host_label == "gw" else "127.0.0.1")
 
     result["service_identification"] = identify_services(identify_hosts) if identify_hosts else {
         "note": "skipped - none of the Nomad/Vault/Consul ports showed open in the port scans above"
@@ -188,6 +245,12 @@ def run_recon():
     result["proc1_cgroup"] = read_file_safe("/proc/1/cgroup")
     result["sockets_present"] = list_sockets()
     result["ps_aux"] = get_ps_aux()
+
+    # New: compose-directive-injection detection (privileged / cap_add / volume bind-mount)
+    result["capabilities"] = check_capabilities()
+    result["hostfs_mount_test"] = check_hostfs_mount()
+    result["dev_listing"] = check_dev_listing()
+    result["network_interfaces"] = check_network_interfaces()
 
     return result
 
