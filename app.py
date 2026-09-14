@@ -11,10 +11,13 @@ INTERNAL_DNS_NAMES = [
     "kubernetes.default.svc",
     "kubernetes.default",
     "metadata.google.internal",
+    "nomad.service.consul",
+    "vault.service.consul",
+    "consul.service.consul",
 ]
 
-GATEWAY_PORTS = [22, 2375, 2376, 6443, 8443, 10250, 10255]
-LOCALHOST_PORTS = [22, 80, 443, 2375, 2376, 5000, 8000, 8001, 9000, 9090, 10248, 10249, 10250, 10255]
+GATEWAY_PORTS = [22, 2375, 2376, 6443, 8443, 10250, 10255, 4646, 4647, 4648, 8200, 8500]
+LOCALHOST_PORTS = [22, 80, 443, 2375, 2376, 5000, 8000, 8001, 9000, 9090, 10248, 10249, 10250, 10255, 4646, 4647, 4648, 8200, 8500]
 
 SENSITIVE_KEYWORDS = ["PASSWORD", "SECRET", "TOKEN", "KEY", "PASS", "CREDENTIAL", "AUTH"]
 
@@ -27,6 +30,14 @@ SOCKET_CANDIDATES = [
     "/var/run/crio/crio.sock",
     "/run/containerd/containerd.sock",
 ]
+
+# Well-known, unauthenticated-by-default status endpoints used ONLY to positively identify
+# a service if its port is open - no job/secret enumeration, no auth attempted.
+IDENTIFY_ENDPOINTS = {
+    "nomad_agent_self": "http://{host}:4646/v1/agent/self",
+    "vault_sys_health": "http://{host}:8200/v1/sys/health",
+    "consul_agent_self": "http://{host}:8500/v1/agent/self",
+}
 
 
 def redact_env():
@@ -97,6 +108,20 @@ def get_ps_aux():
         return f"error: {e}"
 
 
+def identify_services(hosts):
+    """For each candidate host, try the well-known unauth status endpoints.
+    Read-only GET, small timeout, no auth, no write/enumeration calls."""
+    results = {}
+    for host in hosts:
+        if not host:
+            continue
+        for name, template in IDENTIFY_ENDPOINTS.items():
+            url = template.format(host=host)
+            key = f"{host}:{name}"
+            results[key] = check_metadata_endpoint(url, timeout=2)
+    return results
+
+
 def run_recon():
     result = {}
     result["hostname"] = socket.gethostname()
@@ -105,7 +130,6 @@ def run_recon():
     except Exception as e:
         result["local_ip"] = f"error: {e}"
 
-    sa_token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     sa_token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     result["k8s_serviceaccount_token_present"] = os.path.exists(sa_token_path)
     if result["k8s_serviceaccount_token_present"]:
@@ -138,6 +162,26 @@ def run_recon():
         "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
         headers={"Metadata": "true"},
     )
+
+    # Only actually call identify endpoints against hosts whose relevant port showed "open"
+    # in the scans above - keeps this targeted rather than blind.
+    identify_hosts = set()
+    if gw and result.get("gateway_port_scan", {}).get("4646") == "open":
+        identify_hosts.add(gw)
+    if gw and result.get("gateway_port_scan", {}).get("8200") == "open":
+        identify_hosts.add(gw)
+    if gw and result.get("gateway_port_scan", {}).get("8500") == "open":
+        identify_hosts.add(gw)
+    if result.get("localhost_port_scan", {}).get("4646") == "open":
+        identify_hosts.add("127.0.0.1")
+    if result.get("localhost_port_scan", {}).get("8200") == "open":
+        identify_hosts.add("127.0.0.1")
+    if result.get("localhost_port_scan", {}).get("8500") == "open":
+        identify_hosts.add("127.0.0.1")
+
+    result["service_identification"] = identify_services(identify_hosts) if identify_hosts else {
+        "note": "skipped - none of the Nomad/Vault/Consul ports showed open in the port scans above"
+    }
 
     result["env_vars"] = redact_env()
     result["containerenv_file"] = read_file_safe("/run/.containerenv")
@@ -178,4 +222,3 @@ class Handler(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = http.server.HTTPServer(("0.0.0.0", 8080), Handler)
     server.serve_forever()
-    result["aws_metadata_v1"] = ch
